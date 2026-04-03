@@ -54,6 +54,13 @@ def _menu_summary():
 def _extract_phone_and_order(text: str):
     return bl.extract_phone_and_order(text)
 
+def _spell_last_four(phone: str | None) -> str:
+    """Return last 4 digits spaced out so TTS reads them individually."""
+    if not phone:
+        return ""
+    digits = [c for c in phone if c.isdigit()]
+    return " ".join(digits[-4:]) if len(digits) >= 4 else " ".join(digits)
+
 async def _save_phone_number(phone: str | None = None, *, call_sid: str | None = None):
     from .business_logic import normalize_phone
     s = await sessions.get_or_create(call_sid or "unknown")
@@ -63,13 +70,13 @@ async def _save_phone_number(phone: str | None = None, *, call_sid: str | None =
     else:
         p = s.phone  # use pre-filled caller ID
     s.phone_confirmed = False
-    return {"ok": bool(p), "phone": p}
+    return {"ok": bool(p), "phone": p, "last_four_spoken": _spell_last_four(p)}
 
 # NEW: explicit confirmation tool (minimal addition)
 async def _confirm_phone_number(confirmed: bool, *, call_sid: str | None = None):
     s = await sessions.get_or_create(call_sid or "unknown")
     s.phone_confirmed = bool(confirmed) and bool(s.phone)
-    return {"ok": s.phone_confirmed, "phone": s.phone}
+    return {"ok": s.phone_confirmed, "phone": s.phone, "last_four_spoken": _spell_last_four(s.phone)}
 
 # Back-compat no-ops for staged flow (so the prompt doesn’t break)
 async def _confirm_pending_to_cart(*, call_sid: str | None = None):

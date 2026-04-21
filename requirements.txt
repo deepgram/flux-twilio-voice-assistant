@@ -6,4 +6,4 @@ websockets==12.0
 
 # Twilio SMS
 twilio==9.2.3
-python-dotenv==1.0.1
+python-dotenv==1.2.2

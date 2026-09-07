@@ -14,9 +14,24 @@ class CallSession:
     order_number: Optional[str] = None                          # set after checkout (not finalized)
     pending_item: Optional[Dict[str, Any]] = None               # (not used in this build)
 
+    # E.164, US or international (see business_logic.normalize_phone); None if
+    # the caller ID was withheld and the caller never gave a usable number.
     phone: Optional[str] = None
     phone_confirmed: bool = False
     received_sms_sent: bool = False
+    # Order has been committed to the store; guards against double-finalizing.
+    # Separate from received_sms_sent, because an order with no phone still
+    # gets registered — it just never gets an SMS.
+    finalized: bool = False
+    # Outcome of the confirmation SMS attempted during the call by the
+    # send_confirmation_text tool: "sent" | "failed" | "skipped" | None (never
+    # attempted). Carried here so finalize records it instead of re-sending.
+    sms_status: Optional[str] = None
+    sms_reason: str = ""
+    # Set before the send starts. The tool executor times out at 8s, so a slow
+    # Twilio call can be abandoned mid-flight — this stops finalize from firing
+    # a second text at the customer.
+    sms_attempted: bool = False
 
     # Optional: Deepgram request id for debugging/trace
     dg_request_id: Optional[str] = None

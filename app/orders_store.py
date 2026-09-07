@@ -78,6 +78,28 @@ def set_order_status(order_number: str, status: str) -> bool:
                 return True
         return False
 
+def set_order_sms_status(order_number: str, which: str, status: str, reason: str = "") -> bool:
+    """Record the outcome of an SMS attempt on an already-stored order.
+
+    `which` is "received" (order confirmation) or "ready" (pickup notice);
+    `status` is "sent", "failed" or "skipped". The order is written first and
+    the SMS attempted after, so this is how the real outcome gets back onto the
+    record the dashboards read.
+    """
+    with _lock:
+        data = _read_unlocked()
+        for o in data["orders"]:
+            if o.get("order_number") == order_number:
+                o[f"sms_{which}"] = {"status": status, "reason": reason}
+                if which == "received":
+                    # what /staff keys its badge off
+                    o["sms_status"] = status
+                    o["sms_reason"] = reason
+                    o["sms_capable"] = (status == "sent")
+                _write_unlocked(data)
+                return True
+        return False
+
 def get_order(order_number: str) -> dict | None:
     """Return full order dict by order_number."""
     data = _read()

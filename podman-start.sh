@@ -19,11 +19,17 @@ fi
 echo "🧱 Building image dg-drinks:local ..."
 podman build -t dg-drinks:local -f Containerfile .
 
+# Per-call logs are written inside the container to /app/logs; bind-mount the
+# host ./logs over it so one file per call shows up in this directory.
+mkdir -p logs
+chmod 777 logs 2>/dev/null || true
+
 echo "🚀 Starting container on :8000 ..."
 podman run -d --name dg-drinks \
   --restart unless-stopped \
   -p 8000:8000 \
   --env-file .env \
+  -v "$(pwd)/logs:/app/logs" \
   dg-drinks:local
 
 echo ""
@@ -37,6 +43,9 @@ echo "   (Then set NGROK_HOST in .env and Twilio Voice webhook to https://<NGROK
 echo ""
 echo "🔎 Logs (follow):"
 echo "   podman logs -f dg-drinks"
+echo ""
+echo "📝 Per-call log files (one per call):"
+echo "   ./logs/<caller-digits>_<timestamp>_<callsid>.log"
 echo ""
 echo "🛑 To stop and remove container manually:"
 echo "   podman stop dg-drinks && podman rm dg-drinks"

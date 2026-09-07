@@ -183,21 +183,40 @@ async def get_cart(call_sid: str | None = None):
 # --- Phone / orders ---
 PHONE_RE = re.compile(r'\+?\d[\d\-\s()]{9,}\d')
 US_E164 = re.compile(r'^\+1\d{10}$')
+# ITU-T E.164: country code (never starts with 0) + subscriber, 8-15 digits total.
+ANY_E164 = re.compile(r'^\+[1-9]\d{7,14}$')
 
 def normalize_phone(p: str | None) -> str | None:
+    """Normalize a phone number to E.164, US or international, or None if unusable.
+
+    Order matters: an explicit country code (a leading "+", or the "00"
+    international dialing prefix) is always honoured, so a short foreign number
+    like +45 12 34 56 78 is never mistaken for a 10-digit US one. Bare digits
+    with no country code are assumed to be NANP, since this is a US phone line.
+    """
     if not p:
         return None
-    digits = re.sub(r'\D', '', p)
+    raw = p.strip()
+    digits = re.sub(r'\D', '', raw)
+    if not digits:
+        return None
+
+    if raw.startswith("+") or raw.startswith("00"):
+        candidate = "+" + (digits[2:] if raw.startswith("00") else digits)
+        # Keep US numbers held to the stricter NANP shape; accept any other
+        # country code that is a plausible E.164 number.
+        pattern = US_E164 if candidate.startswith("+1") else ANY_E164
+        return candidate if pattern.fullmatch(candidate) else None
+
     if len(digits) == 10:
         return "+1" + digits
     if len(digits) == 11 and digits.startswith("1"):
         return "+1" + digits[1:]
-    if p.strip().startswith("+"):
-        candidate = "+" + digits
-        if US_E164.fullmatch(candidate):
-            return candidate
-        return None
     return None
+
+def is_international(phone: str | None) -> bool:
+    """True for an E.164 number outside the US/NANP (+1) range."""
+    return bool(phone) and not US_E164.fullmatch(phone)
 
 def random_order_no() -> str:
     n = random.randint(0, 9999)

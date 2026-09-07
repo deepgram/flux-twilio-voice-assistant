@@ -28,6 +28,12 @@ async def _get_cart(*, call_sid: str | None = None):
 
 async def _checkout_order(phone: str | None = None, *, call_sid: str | None = None):
     # Generate order number, but do not finalize.
+    # The model usually calls this with no phone, having already stored it via
+    # save_phone_number — fall back to the session so the per-phone drink limit
+    # is actually applied and the number lands on the order.
+    if not phone:
+        s = await sessions.get_or_create(call_sid or "unknown")
+        phone = s.phone
     res = await bl.checkout_order(phone, call_sid=call_sid)
     if isinstance(res, dict) and res.get("ok"):
         s = await sessions.get_or_create(call_sid or "unknown")
@@ -61,22 +67,43 @@ def _spell_last_four(phone: str | None) -> str:
     digits = [c for c in phone if c.isdigit()]
     return " ".join(digits[-4:]) if len(digits) >= 4 else " ".join(digits)
 
+def _spell_full(phone: str | None) -> str:
+    """Whole number spaced out for TTS, e.g. '+4915122' -> 'plus 4 9 1 5 1 2 2'.
+
+    Used for international numbers, where the last four digits aren't enough to
+    catch a misheard country code.
+    """
+    if not phone:
+        return ""
+    digits = " ".join(c for c in phone if c.isdigit())
+    return f"plus {digits}" if phone.startswith("+") else digits
+
+def _phone_payload(phone: str | None) -> dict:
+    """Shared tool response describing the number currently on file."""
+    international = bl.is_international(phone)
+    return {
+        "phone": phone,
+        "international": international,
+        "last_four_spoken": _spell_last_four(phone),
+        # only populated for international numbers; read this back in full
+        "full_number_spoken": _spell_full(phone) if international else "",
+    }
+
 async def _save_phone_number(phone: str | None = None, *, call_sid: str | None = None):
-    from .business_logic import normalize_phone
     s = await sessions.get_or_create(call_sid or "unknown")
     if phone:
-        p = normalize_phone(phone)
+        p = bl.normalize_phone(phone)
         s.phone = p
     else:
         p = s.phone  # use pre-filled caller ID
     s.phone_confirmed = False
-    return {"ok": bool(p), "phone": p, "last_four_spoken": _spell_last_four(p)}
+    return {"ok": bool(p), **_phone_payload(p)}
 
 # NEW: explicit confirmation tool (minimal addition)
 async def _confirm_phone_number(confirmed: bool, *, call_sid: str | None = None):
     s = await sessions.get_or_create(call_sid or "unknown")
     s.phone_confirmed = bool(confirmed) and bool(s.phone)
-    return {"ok": s.phone_confirmed, "phone": s.phone, "last_four_spoken": _spell_last_four(s.phone)}
+    return {"ok": s.phone_confirmed, **_phone_payload(s.phone)}
 
 # Back-compat no-ops for staged flow (so the prompt doesn’t break)
 async def _confirm_pending_to_cart(*, call_sid: str | None = None):
@@ -91,6 +118,51 @@ async def _order_is_placed(*, call_sid: str | None = None):
     s = await sessions.get_or_create(call_sid or "unknown")
     placed = bool(s.order_number)
     return {"placed": placed, "order_number": s.order_number}
+
+async def _send_confirmation_text(*, call_sid: str | None = None):
+    """Send the order-confirmation SMS *now* and report what happened.
+
+    The agent calls this right after checkout_order, while it can still speak to
+    the customer — that's the whole point. If the text can't be delivered, the
+    agent has to say so on the call, because nobody is going to see the staff
+    console badge on the customer's behalf.
+    """
+    from .send_sms import send_received_sms
+
+    s = await sessions.get_or_create(call_sid or "unknown")
+    if not s.order_number:
+        return {"ok": False, "error": "No order yet - call checkout_order first.",
+                "sms_status": "none"}
+    if s.sms_status == "sent":
+        return {"ok": True, "sms_status": "sent", "already_sent": True,
+                "tell_customer": "The text is already on its way; no need to mention it again."}
+
+    if not s.phone:
+        status, reason = "skipped", "no phone number on file"
+    elif not s.phone_confirmed:
+        status, reason = "skipped", "the number has not been confirmed yet"
+    else:
+        # Twilio's client is blocking HTTP; keep it off the event loop so the
+        # caller's audio doesn't stutter mid-sentence.
+        s.sms_attempted = True
+        res = await asyncio.to_thread(send_received_sms, s.order_number, s.phone)
+        if res.get("ok"):
+            status, reason = "sent", ""
+            s.received_sms_sent = True
+        else:
+            status, reason = "failed", res.get("reason") or "send failed"
+
+    s.sms_status, s.sms_reason = status, reason
+
+    if status == "sent":
+        tell = "Confirm you've sent the text, then finish as normal."
+    else:
+        tell = ("The text did NOT go through. Tell the customer you couldn't send it and "
+                "that they should use their order number to pick up their drink. Read the "
+                "order number back to them digit by digit again so they have it. Do not "
+                "promise any text messages.")
+    return {"ok": status == "sent", "sms_status": status, "reason": reason,
+            "order_number": s.order_number, "tell_customer": tell}
 
 # ---------- Tool definitions (Deepgram Agent expects this schema) ----------
 FUNCTION_DEFS: list[Dict[str, Any]] = [
@@ -197,7 +269,12 @@ FUNCTION_DEFS: list[Dict[str, Any]] = [
     # Phone capture + confirmation (NEW)
     {
         "name": "save_phone_number",
-        "description": "Save or retrieve the customer's phone number for pickup. If no phone is provided, returns the caller ID number already on file.",
+        "description": ("Save or retrieve the customer's phone number for pickup. If no phone is provided, "
+                        "returns the caller ID number already on file. International numbers are accepted; "
+                        "include the country code with a leading + when passing one. Returns ok:false with "
+                        "phone:null if no usable number is available. The response's `international` field "
+                        "says whether the number is outside the US, `last_four_spoken` and "
+                        "`full_number_spoken` give TTS-ready digit-by-digit readbacks."),
         "parameters": {
             "type": "object",
             "properties": {"phone": {"type": "string"}},
@@ -205,8 +282,21 @@ FUNCTION_DEFS: list[Dict[str, Any]] = [
         },
     },
     {
+        "name": "send_confirmation_text",
+        "description": ("Send the order-confirmation text message now and report whether it "
+                        "actually went out. Call this once, right after a successful "
+                        "checkout_order. Returns `sms_status`: 'sent' if the text was "
+                        "accepted, 'failed' if the message could not be sent, or 'skipped' "
+                        "if there was no confirmed number to text. When it is not 'sent', "
+                        "follow the `tell_customer` guidance in the response - the customer "
+                        "must be told on the call to pick up using their order number."),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "confirm_phone_number",
-        "description": "Confirm (true) or reject (false) the previously provided phone number.",
+        "description": ("Confirm (true) or reject (false) the previously provided phone number. "
+                        "Call this with true once the customer agrees the number is correct, including "
+                        "for international numbers."),
         "parameters": {
             "type": "object",
             "properties": {"confirmed": {"type": "boolean"}},
@@ -233,6 +323,7 @@ FUNCTION_MAP: dict[str, Any] = {
     "extract_phone_and_order": _extract_phone_and_order,
     "save_phone_number": _save_phone_number,
     "confirm_phone_number": _confirm_phone_number,  # NEW
+    "send_confirmation_text": _send_confirmation_text,
     "confirm_pending_to_cart": _confirm_pending_to_cart,
     "clear_pending_item": _clear_pending_item,
 }

@@ -21,8 +21,9 @@ from .audio import (
 )
 from .agent_client import connect_agent, send_agent_settings
 from .agent_functions import FUNCTION_MAP
-from .orders_store import add_order
+from .orders_store import add_order, set_order_sms_status
 from .send_sms import send_received_sms
+from .call_logger import begin_context, start_call_log, end_call_log
 from . import business_logic as bl
 
 log = logging.getLogger("ws_bridge")
@@ -131,8 +132,15 @@ async def execute_agent_function(tool_name: str, args: dict, *, call_sid: str):
 
 # ========== Finalize & notify ==========
 async def _finalize_and_notify(call_sid: str):
+    """Commit the order, then try to text the customer.
+
+    Registering the order and sending the SMS are deliberately separate: an
+    order the caller has been given a number for MUST reach the store and the
+    dashboards even when we have no phone number to text, or the customer shows
+    up for a drink nobody is making.
+    """
     s = await sessions.get(call_sid)
-    if not s or s.received_sms_sent or not s.order_number or not s.phone_confirmed or not s.phone:
+    if not s or s.finalized or not s.order_number:
         return
 
     fin = await bl.finalize_order(s.order_number, call_sid=call_sid)
@@ -140,24 +148,70 @@ async def _finalize_and_notify(call_sid: str):
         log.error(f"[{call_sid}] finalize failed: {fin}")
         return
 
+    phone = fin.get("phone") or s.phone
+    order_no = fin["order_number"]
+
     order = {
-        "order_number": fin["order_number"],
-        "phone": fin.get("phone") or s.phone,
+        "order_number": order_no,
+        "phone": phone,
         "items": fin.get("items") or [],
         "total": 0.0,
         "status": fin.get("status", "received"),
         "created_at": fin.get("created_at", int(time.time())),
+        # Provisional until the send below actually reports back; the dashboards
+        # key their message off sms_status, so start it as "pending".
+        "sms_status": "pending",
+        "sms_reason": "",
+        "sms_capable": False,
     }
 
     add_order(order)
-    await publish("orders", {"type": "order_created", "order_number": order["order_number"], "status": order["status"]})
+    s.finalized = True
+    await publish("orders", {"type": "order_created", "order_number": order_no, "status": order["status"]})
+    log.info(f"[{call_sid}] 🧾 order registered ({order_no})")
 
-    try:
-        send_received_sms(order["order_number"], order["phone"])
-        s.received_sms_sent = True
-        log.info(f"[{call_sid}] ✅ SMS(sent) and order persisted ({order['order_number']})")
-    except Exception as e:
-        log.warning(f"[{call_sid}] SMS failed: {e}")
+    # --- the confirmation SMS outcome decides the dashboard message ---
+    if s.sms_status:
+        # The agent already attempted it mid-call via send_confirmation_text and
+        # told the customer the result; don't text twice, just record it.
+        status, reason = s.sms_status, s.sms_reason
+        log.info(f"[{call_sid}] confirmation SMS already attempted in-call: {status}")
+    elif s.sms_attempted:
+        # In-flight send was abandoned (tool timeout). Never re-send — a
+        # duplicate text is worse than an unknown outcome.
+        status, reason = "failed", "send timed out during the call — delivery unconfirmed"
+        log.warning(f"[{call_sid}] confirmation SMS attempt for {order_no} was abandoned mid-flight")
+    elif not phone:
+        status, reason = "skipped", "no phone number on file"
+    elif not s.phone_confirmed:
+        # An unconfirmed number is not one we have consent to text.
+        status, reason = "skipped", "number never confirmed by the caller"
+    else:
+        # Fallback for calls where the agent never called the tool.
+        if bl.is_international(phone):
+            log.info(f"[{call_sid}] international number {phone} — delivery depends on "
+                     f"Twilio geo permissions for that country")
+        res = await asyncio.to_thread(send_received_sms, order_no, phone)
+        if res.get("ok"):
+            status, reason = "sent", ""
+            s.received_sms_sent = True
+        else:
+            status, reason = "failed", res.get("reason") or "send failed"
+
+    await _record_sms_outcome(call_sid, order_no, "received", status, reason)
+
+
+async def _record_sms_outcome(call_sid: str, order_no: str, which: str, status: str, reason: str):
+    """Persist an SMS outcome and push it to the dashboards."""
+    set_order_sms_status(order_no, which, status, reason)
+    if status == "sent":
+        log.info(f"[{call_sid}] ✅ {which} SMS sent for {order_no}")
+    else:
+        log.warning(f"[{call_sid}] ⚠️  {which} SMS {status} for {order_no}: {reason} — "
+                    f"order is registered; pickup by order number")
+    with contextlib.suppress(Exception):
+        await publish("orders", {"type": "order_sms_status", "order_number": order_no,
+                                 "which": which, "sms_status": status, "reason": reason})
 
 async def _finalize_and_hangup(call_sid: str):
     if call_sid in _HUNG_UP or call_sid in _HANGUP_INFLIGHT:
@@ -178,6 +232,9 @@ async def twilio_ws(ws: WebSocket):
     await ws.accept()
     call_sid: str = "unknown"
     stream_sid: Optional[str] = None
+
+    # Tag this connection (and every task it spawns) for per-call file logging.
+    log_ctx = begin_context()
 
     agent = None
     agent_reader_task = None
@@ -323,6 +380,11 @@ async def twilio_ws(ws: WebSocket):
                 _HUNG_UP.discard(call_sid)
                 _HANGUP_INFLIGHT.discard(call_sid)
 
+                call_log = start_call_log(log_ctx, call_sid, phone=s.phone or caller_phone,
+                                          stream_sid=stream_sid)
+                if call_log:
+                    log.info(f"[{call_sid}] 📝 call log: {call_log}")
+
                 agent = await connect_agent()
                 await send_agent_settings(agent)
                 agent_reader_task = asyncio.create_task(_agent_reader())
@@ -371,6 +433,20 @@ async def twilio_ws(ws: WebSocket):
             if agent:
                 await agent.close()
 
+        # snapshot for the call log footer, before the session goes away
+        call_summary: dict = {}
+        with contextlib.suppress(Exception):
+            s = await sessions.get(call_sid)
+            if s:
+                call_summary = {
+                    "order":     s.order_number or "-",
+                    "caller":    s.phone or "-",
+                    "intl":      bl.is_international(s.phone),
+                    "confirmed": s.phone_confirmed,
+                    "registered": s.finalized,
+                    "sms_sent":  s.received_sms_sent,
+                }
+
         # session cleanup + event
         with contextlib.suppress(Exception):
             if call_sid and call_sid != "unknown":
@@ -378,6 +454,9 @@ async def twilio_ws(ws: WebSocket):
                 await sessions.remove(call_sid)
         _HUNG_UP.discard(call_sid)
         _HANGUP_INFLIGHT.discard(call_sid)
+
+        # close the per-call log file last, so it captures the teardown above
+        end_call_log(log_ctx, call_summary)
 
 # Back-compat shim
 def register_ws_routes(app):

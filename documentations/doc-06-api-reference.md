@@ -328,7 +328,33 @@ Functions available to the Deepgram Agent during conversation.
 
   "phone": "xxx-xxx-xxxx"
 
-**Note:** Automatically normalizes to E.164 format (+1XXXXXXXXXX)
+**Note:** Automatically normalizes to E.164. Bare 10-digit (or 1+10) input is
+assumed to be US (`+1XXXXXXXXXX`); a leading `+` or `00` is honoured as an
+explicit country code, so international numbers are accepted as-is
+(`+49XXXXXXXXXXX`). Unusable input returns `ok: false` with `phone: null`.
+
+**Returns:** `phone`, plus `international` (true when the number is outside
+the US/NANP `+1` range), `last_four_spoken`, and `full_number_spoken` (only
+populated for international numbers).
+
+### send_confirmation_text
+
+**Description:** Send the order-confirmation SMS during the call and report the
+result, so the agent can tell the customer if it failed. No parameters; call
+once after a successful `checkout_order`.
+
+**Returns:** `sms_status` (`sent` | `failed` | `skipped`), `reason`,
+`order_number`, and `tell_customer` (what the agent should say). Idempotent —
+a repeat call returns `already_sent: true` without sending again.
+
+**SMS outcome fields** (on the stored order, returned by
+`GET /api/orders/phone/{order_no}`):
+
+- `sms_status` — `sent` | `failed` | `skipped` | `pending`, the real result of
+  the order-confirmation SMS
+- `sms_reason` — human-readable cause when not `sent`
+- `sms_ready` — `{status, reason}` for the ready-for-pickup SMS
+- `sms_capable` — convenience alias for `sms_status == "sent"`
 
 ### checkout_order
 

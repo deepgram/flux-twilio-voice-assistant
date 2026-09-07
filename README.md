@@ -75,10 +75,36 @@ AI: "Thank you! Your order number is 4782. We'll text you when it's ready for pi
 ### Prerequisites
 
 - Python 3.11+
-- Podman or Docker
+- Podman or Docker (see [Local Container Runtimes](#local-container-runtimes) below)
 - ngrok (for local testing)
 - Twilio account with A2P 10DLC approval
 - Deepgram API key
+
+### Local Container Runtimes
+
+This project ships two equivalent script pairs — use whichever matches the runtime
+you have installed. Both build the same `Containerfile` and publish host port 8000.
+
+| Runtime | Install | Start | Stop |
+|---|---|---|---|
+| **Colima** (Docker engine, no GUI) | `brew install colima docker` | `colima start` then `./docker-start.sh` | `./docker-stop.sh` |
+| **Podman** | `brew install podman` then `podman machine init` | `./podman-start.sh` | `./podman-stop.sh` |
+
+Notes:
+
+- **Docker Desktop is not required**, and its license needs a paid subscription at
+  companies over 250 employees or $10M revenue. The `docker` CLI itself is
+  Apache-2.0 and free — Colima and Rancher Desktop both supply a free daemon for
+  it. `docker-start.sh` never launches a GUI app; it just checks for a reachable
+  daemon and prints setup hints if there isn't one.
+- **Rancher Desktop** also works with the `docker-*.sh` scripts (free, Apache-2.0)
+  if you want a GUI.
+- **Both runtimes can be installed side by side** — they use separate VMs and
+  separate image stores and don't conflict. Just don't run both containers at
+  once, since both publish host port 8000.
+- **Leave `DOCKER_HOST` unset.** It silently overrides your docker context, so
+  `docker` commands can end up talking to a different runtime than you expect.
+  `docker-start.sh` warns you if it's set.
 
 ### 5-Minute Setup
 
@@ -92,7 +118,7 @@ cp sample.env.txt .env
 # - Get Deepgram API key: https://console.deepgram.com/
 # - Get Twilio credentials: https://console.twilio.com/
 
-# 3. Start the application
+# 3. Start the application (or ./docker-start.sh — see Local Container Runtimes)
 ./podman-start.sh
 
 # 4. Expose to internet (separate terminal)
@@ -136,14 +162,17 @@ flux-twilio-voice-assistant/
 │   ├── audio.py                  # Audio format conversion (u-law <> Linear16)
 │   ├── send_sms.py               # Twilio SMS integration
 │   ├── session.py                # User session management
-│   ├── call_logger.py            # Call logging and debugging
+│   ├── call_logger.py            # Per-call log files (one file per call)
 │   ├── order_ids.py              # Order ID generation utilities
 │   └── orders.json               # Order storage (auto-reset on startup)
 │
+├── logs/                         # One log file per call (bind-mounted, gitignored)
 ├── documentations/               # Comprehensive documentation
 ├── Containerfile                 # Podman/Docker build configuration
-├── podman-start.sh               # Local development script
-├── podman-stop.sh                # Cleanup script
+├── podman-start.sh               # Local development script (Podman)
+├── podman-stop.sh                # Cleanup script (Podman)
+├── docker-start.sh               # Local development script (Docker/Colima)
+├── docker-stop.sh                # Cleanup script (Docker/Colima)
 ├── requirements.txt              # Python dependencies
 ├── sample.env.txt                # Environment variables template
 └── README.md                     # This file
@@ -202,9 +231,145 @@ MSG_TWILIO_FROM_E164=+1234567890
 AGENT_LANGUAGE=en
 AGENT_TTS_MODEL=aura-2-odysseus-en
 AGENT_STT_MODEL=flux-general-en
+
+# Per-call log files (all optional)
+CALL_LOG_TO_FILE=1                 # 0 to keep stdout-only logging
+CALL_LOG_DIR=/app/logs             # container path; bind-mounted to ./logs
+CALL_LOG_LEVEL=INFO                # file-only level; stdout still uses LOG_LEVEL
+TZ=America/New_York                # timestamps + log filenames; container default is UTC
 ```
 
+## Phone Numbers & SMS
+
+Numbers are normalized to E.164 by `normalize_phone()` in
+[app/business_logic.py](app/business_logic.py):
+
+| Caller input | Stored as | `international` |
+|---|---|---|
+| `415 555 1234` (bare digits) | `+14155551234` | false |
+| `+14155551234` | `+14155551234` | false |
+| `+34628352364` | `+34628352364` | true |
+| `0049151226247926` (`00` prefix) | `+49151226247926` | true |
+| `+34` / garbage | `null` | — |
+
+An explicit country code always wins: a leading `+` or `00` is never
+reinterpreted as a US number, so short foreign numbers (`+45`, `+47`) stay
+intact. Bare digits with no country code are assumed to be US, since this is a
+US phone line.
+
+**What the agent does with it.** `save_phone_number` returns an
+`international` flag, and the prompt branches on it: a US number is read back
+by its last four digits with no mention of where it's from, while an
+international number is announced as such and read back **in full** (a
+misheard country code can't be caught from the last four digits). If no usable
+number is available, the agent asks once, then proceeds without one.
+
+**An order is never blocked by a missing phone number.** Registering the order
+and sending the SMS are separate steps in `_finalize_and_notify`
+([app/ws_bridge.py](app/ws_bridge.py)): the order always reaches the store and
+both dashboards, and the SMS is a best-effort follow-up.
+
+**The dashboard message follows what the send actually did.** Each order gets
+two SMS attempts — the confirmation when the order is placed, and the pickup
+notice when staff hit Done. The confirmation's real outcome is recorded on the
+order as `sms_status`, and `/staff` renders from that:
+
+| `sms_status` | Staff console shows | When |
+|---|---|---|
+| `sent` | just the number (`INTL` chip if international) | Twilio accepted the message |
+| `failed` | red **"SMS failed — pickup by order number"** + the reason | Twilio rejected it — bad credentials, no messaging-enabled number, country not enabled, unroutable number |
+| `skipped` | amber **"no SMS — pickup by order number"** + the reason | nothing was attempted: no number on file, or the caller never confirmed one |
+| `pending` | grey "sending text…" | order registered, send still in flight |
+
+**The agent finds out during the call.** The send happens while the agent can
+still speak: after a successful `checkout_order` it calls the
+`send_confirmation_text` tool, which sends the text and returns
+`sms_status` plus a `tell_customer` instruction. On `failed` or `skipped` the
+agent tells the caller it couldn't text them, re-reads the order number
+digit-by-digit, and stops promising texts for the rest of the call — including
+in its closing line. So the customer hangs up knowing to pick up by order
+number, rather than waiting for a text that never arrives.
+
+The tool is idempotent (a second call reports `already_sent`), Twilio's
+blocking HTTP client runs via `asyncio.to_thread` so call audio doesn't
+stutter, and if the send outruns the 8s tool timeout it is recorded as
+`failed — delivery unconfirmed` rather than retried, since a duplicate text is
+worse than an unknown outcome. If the agent never calls the tool,
+`_finalize_and_notify` still sends at the end of the call as before.
+
+Twilio error codes are translated into something a barista can act on in
+[app/send_sms.py](app/send_sms.py) (`_TWILIO_REASONS`) — e.g. a 401 becomes
+*"messaging credentials rejected (no messaging-enabled number?)"* and 21408
+becomes *"SMS to this country is not enabled on the Twilio account"*. Both
+senders return `{"ok", "reason", "sid"}` and never raise, so the outcome is
+always recordable. The pickup notice's outcome is stored separately as
+`sms_ready` and returned by `/api/orders/phone/{order_no}`.
+
+## Per-Call Log Files
+
+Alongside the container's stdout logging, every call gets its own file in
+`./logs` on the host (bind-mounted to `/app/logs` in the container by
+`podman-start.sh` / `docker-start.sh`):
+
+```
+logs/15551234567_20260828-151548_a1b2c3d4.log
+     └─ caller digits  └─ start time  └─ CallSid tail
+```
+
+The caller-digits prefix means you can find a caller's most recent call with
+`ls logs/15551234567_*.log`. Timestamps are container-local — the container
+defaults to UTC, so set `TZ` in `.env` if you'd rather read them in your own
+timezone. Each file holds everything the app logged while
+handling that call — agent events, transcript lines, tool calls and results,
+SMS sends, errors — plus a header and a footer:
+
+```
+================================================================================
+CALL START   2026-08-28T15:15:48
+call_sid     CAxxxxxxxx
+stream_sid   MZxxxxxxxx
+caller       +15551234567
+================================================================================
+2026-08-28 15:15:49 INFO [ws_bridge] [CAxxxxxxxx] Agent: {"type":"ConversationText",...}
+2026-08-28 15:15:52 INFO [ws_bridge] [CAxxxxxxxx] 🔧 function.call add_drink({...})
+2026-08-28 15:16:04 INFO [send_sms] [CAxxxxxxxx] 📱 SMS (received) to +1555…: order 1234
+================================================================================
+CALL END     2026-08-28T15:16:05
+duration     17.2s
+order        1234
+caller       +15551234567
+confirmed    True
+sms_sent     True
+================================================================================
+```
+
+When staff later hit **Done** in `/staff`, the ready-for-pickup notification is
+appended to that caller's most recent call log too.
+
+Concurrent calls stay separate: each websocket connection is tagged in its own
+async context, and a call's log file only accepts records emitted inside it —
+including from the background tasks that call spawns. If the logs directory
+can't be created or written, the app logs one warning and keeps running.
+
+Useful greps:
+
+```bash
+tail -f logs/*.log                      # follow whatever is on the line now
+grep -l "order        1234" logs/*.log  # which call produced order 1234
+grep -h "ConversationText" logs/1555*.log  # one caller's transcript lines
+```
+
+
+## International Callers
+
+The `"international"` sentinel is gone — real international numbers are now
+stored and texted. See [Phone Numbers & SMS](#phone-numbers--sms) above.
+
+
 ## Monitoring & Debugging
+
+Substitute `docker` for `podman` throughout if you're using the Docker scripts —
+the container name is `dg-drinks` either way.
 
 ```bash
 # View application logs
@@ -232,7 +397,7 @@ podman logs dg-drinks | grep ERROR
 - Review Twilio logs in console
 
 ```bash
-# Restart application
+# Restart application (or ./docker-stop.sh && ./docker-start.sh)
 ./podman-stop.sh && ./podman-start.sh
 
 # Test endpoints

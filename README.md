@@ -77,7 +77,8 @@ AI: "Thank you! Your order number is 4782. We'll text you when it's ready for pi
 - Python 3.11+
 - Podman or Docker (see [Local Container Runtimes](#local-container-runtimes) below)
 - ngrok (for local testing)
-- Twilio account with A2P 10DLC approval
+- Twilio account with A2P 10DLC approval (US registration; this demo is set up
+  for a US number — see [Phone Numbers & SMS](#phone-numbers--sms))
 - Deepgram API key
 
 ### Local Container Runtimes
@@ -241,6 +242,14 @@ TZ=America/New_York                # timestamps + log filenames; container defau
 
 ## Phone Numbers & SMS
 
+> **This setup assumes a US deployment.** The cart has a US phone number, and
+> "international" throughout the code and the agent prompt means *not US*
+> (anything outside `+1`). Callers from other countries are fully supported —
+> their numbers are stored and texted normally — but if you run this demo
+> somewhere other than the US, see
+> [Running this outside the US](#running-this-outside-the-us) below, because
+> that assumption is baked into a handful of places.
+
 Numbers are normalized to E.164 by `normalize_phone()` in
 [app/business_logic.py](app/business_logic.py):
 
@@ -304,6 +313,26 @@ becomes *"SMS to this country is not enabled on the Twilio account"*. Both
 senders return `{"ok", "reason", "sid"}` and never raise, so the outcome is
 always recordable. The pickup notice's outcome is stored separately as
 `sms_ready` and returned by `/api/orders/phone/{order_no}`.
+
+### Running this outside the US
+
+Nothing here is hard-blocked outside the US, but "home country" is currently
+spelled `+1` in several places. To run the cart in, say, Germany — where a
+`+49` number is *local* and a `+1` number is the international one — adjust:
+
+| What to change | Where |
+|---|---|
+| The home-country pattern. `US_E164` (`^\+1\d{10}$`) defines both "valid local number" and, by negation, `is_international()`. Swap in your country's pattern (e.g. `^\+49\d{10,11}$`). | [app/business_logic.py:185](app/business_logic.py:185), [:217](app/business_logic.py:217) |
+| The bare-digits fallback. Input with no country code is assumed NANP and gets `+1` prepended. Change to your own country code. | [app/business_logic.py:211](app/business_logic.py:211) |
+| The agent's wording. The prompt's CASE A / CASE B branch on `international`, and CASE B says *"you're calling from an international number"* — which reads wrong if the caller is local and *you* are the foreign one. Reword both cases, and the "include the country code if you are outside the US" line in CASE C. | `voice_prompt_template` in [app/menu_config.json](app/menu_config.json) |
+| The staff console's `INTL` chip, which tests `/^\+1\d{10}$/` directly rather than asking the API. | [app/http_routes.py:486](app/http_routes.py:486) |
+| The hardcoded "Call to order" number on the landing page. | [app/http_routes.py:111](app/http_routes.py:111) |
+| `TWILIO_FROM_E164` / `MSG_TWILIO_FROM_E164`, and your Twilio SMS **geo permissions** — these must allow the countries you expect to text, wherever the cart lives. | `.env`, Twilio console |
+
+A cleaner refactor, if you want it properly portable rather than patched: move
+the country pattern into `menu_config.json` (alongside `brand` and `limits`)
+and have `is_international()` read it, so the prompt and the dashboard can be
+phrased as "local" vs. "foreign" instead of "US" vs. "international".
 
 ## Per-Call Log Files
 

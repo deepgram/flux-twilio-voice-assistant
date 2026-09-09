@@ -236,7 +236,7 @@ PRICES = {
 **Business Rules:**
 - Max 10 drinks per order
 - Matcha stencil requires vanilla cream topping
-- Phone number normalization (E.164 format)
+- Phone number normalization (E.164; US and international)
 - Alias matching (e.g., "cream" → "vanilla cream")
 
 **Cart Management:**
@@ -591,7 +591,9 @@ ExecStart=.../uvicorn main:app --workers 2
 chmod 600 .env  # Restrict permissions
 
 **Orders Data:**
-- Phone numbers stored in E.164 format
+- Phone numbers stored in E.164 format (US or international), or `null` when
+  the caller ID was withheld and no number was given — such orders are still
+  registered and are picked up by order number
 - No PII beyond phone + name (if provided)
 - orders.json cleared on server restart
 

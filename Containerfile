@@ -19,7 +19,10 @@ RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 # app code
 COPY app /app/app
 
-# 🔐 give the non-root user ownership so it can write orders.json
+# per-call log files land here (bind-mount ./logs over it to keep them on the host)
+RUN mkdir -p /app/logs
+
+# 🔐 give the non-root user ownership so it can write orders.json + logs
 RUN chown -R appuser:appuser /app
 
 USER appuser

@@ -2,6 +2,7 @@
 import os
 import json as _json
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -12,6 +13,7 @@ from .orders_store import (
     list_in_progress_orders,
     get_order_phone,
     set_order_status,
+    set_order_sms_status,
     add_order,
     get_order,  # full order lookup
 )
@@ -21,10 +23,11 @@ from .business_logic import CONFIG
 
 # Optional call log appends (if file/module exists)
 try:
-    from .call_logger import LOGS_DIR  # type: ignore
+    from .call_logger import append_for_phone  # type: ignore
 except Exception:
-    LOGS_DIR = None  # safe fallback
+    append_for_phone = None  # safe fallback
 
+log = logging.getLogger("http")
 http_router = APIRouter()
 
 # -------------------- Helpers --------------------
@@ -192,8 +195,19 @@ def api_get_order(order_no: str):
 
 @http_router.get("/api/orders/phone/{order_no}")
 def api_get_phone(order_no: str):
-    phone = get_order_phone(order_no)
-    return {"order_number": order_no, "phone": phone}
+    o = get_order(order_no) or {}
+    phone = o.get("phone")
+    # sms_status is the outcome of the confirmation SMS: sent | failed | skipped
+    # | pending. Older records (e.g. /api/seed) only have a phone, so infer.
+    status = o.get("sms_status") or ("sent" if phone else "skipped")
+    return {
+        "order_number": order_no,
+        "phone": phone,
+        "sms_status": status,
+        "sms_reason": o.get("sms_reason", ""),
+        "sms_capable": status == "sent",
+        "ready_sms": o.get("sms_ready", {}),
+    }
 
 @http_router.post("/api/orders/{order_no}/done")
 async def api_mark_done(order_no: str):
@@ -204,33 +218,43 @@ async def api_mark_done(order_no: str):
     await publish("orders", {"type": "order_status_changed", "order_number": order_no, "status": "ready"})
 
     phone = get_order_phone(order_no)
-    if phone:
-        try:
-            send_ready_sms(order_no, phone)
-            # Append to call log if available
-            if LOGS_DIR:
-                try:
-                    sanitized = phone.replace("+", "").replace("-", "").replace(" ", "")
-                    # find latest matching file
-                    matches = list(LOGS_DIR.glob(f"{sanitized}_*.log"))
-                    if matches:
-                        latest = max(matches, key=lambda p: p.stat().st_mtime)
-                        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                        with open(latest, "a", encoding="utf-8") as f:
-                            f.write(f"\n{'='*80}\n")
-                            f.write(f"[{ts}] [ORDER_COMPLETED_BY_STAFF]\n")
-                            f.write(f"Order Number: {order_no}\n")
-                            f.write(f"Status: ready for pickup\n")
-                            f.write(f"[{ts}] [READY_SMS_SENT]\n")
-                            f.write(f"Notification sent to: {phone}\n")
-                            f.write(f"{'='*80}\n\n")
-                        print(f"📝 Logged order completion to: {latest.name}")
-                except Exception as e:
-                    print(f"⚠️ Could not append to call log: {e}")
-        except Exception as e:
-            print(f"❌ SMS send failed for {order_no}: {e}")
+    if not phone:
+        # No number on file: the order is still marked ready, the customer
+        # picks up by order number. Never block the status change on SMS.
+        set_order_sms_status(order_no, "ready", "skipped", "no phone number on file")
+        log.warning(f"no phone on file for {order_no} — marked ready, no SMS sent "
+                    f"(pickup by order number)")
+        return {"ok": True, "sms_sent": False, "reason": "no_phone_on_file"}
 
-    return {"ok": True}
+    # Twilio's client blocks; keep it off the event loop, which is also
+    # carrying live call audio for anyone on the phone right now.
+    res = await asyncio.to_thread(send_ready_sms, order_no, phone)
+    sms_sent = bool(res.get("ok"))
+    reason = "" if sms_sent else (res.get("reason") or "send failed")
+    set_order_sms_status(order_no, "ready", "sent" if sms_sent else "failed", reason)
+    if sms_sent:
+        log.info(f"✅ ready SMS sent for {order_no}")
+    else:
+        log.warning(f"⚠️  ready SMS failed for {order_no}: {reason} — order is marked ready; "
+                    f"tell the customer in person")
+    await publish("orders", {"type": "order_sms_status", "order_number": order_no,
+                             "which": "ready", "sms_status": "sent" if sms_sent else "failed",
+                             "reason": reason})
+
+    # Append to that caller's call log if we still have one
+    if append_for_phone:
+        latest = append_for_phone(phone, [
+            "[ORDER_COMPLETED_BY_STAFF]",
+            f"Order Number: {order_no}",
+            "Status: ready for pickup",
+            "[READY_SMS_SENT]" if sms_sent else "[READY_SMS_FAILED]",
+            f"Notification sent to: {phone}" if sms_sent
+            else f"No SMS sent ({reason}) — pickup by order number",
+        ])
+        if latest:
+            log.info(f"📝 Logged order completion to: {latest.name}")
+
+    return {"ok": True, "sms_sent": sms_sent, "reason": reason}
 
 # --- DEV seed (optional) ---
 @http_router.post("/api/seed")
@@ -351,6 +375,7 @@ def _orders_tv_html(refresh: int) -> str:
           const msg = JSON.parse(ev.data);
           if (msg.type === 'order_created' ||
               msg.type === 'order_status_changed' ||
+              msg.type === 'order_sms_status' ||
               msg.type === 'CallEnded') {{
             load();
           }}
@@ -392,6 +417,16 @@ def _staff_html(refresh: int) -> str:
     button:hover {{ opacity: 0.85; }}
     .detail-item {{ margin: 0 0 6px; line-height: 1.25; }}
     .nowrap {{ white-space: nowrap; }}
+    .nosms {{ display:block; width:fit-content; margin-top:4px; padding:3px 8px; border-radius:6px;
+             font-size:11px; font-weight:700; background:#fde68a; color:#713f12;
+             border:1px solid #f59e0b; line-height:1.3; }}
+    .nosms.failed {{ background:#fecaca; color:#7f1d1d; border-color:#ef4444; }}
+    .nosms.pending {{ background:#e2e8f0; color:#334155; border-color:#94a3b8; }}
+    .why {{ display:block; margin-top:2px; font-size:10px; font-weight:600;
+           color:inherit; opacity:0.78; }}
+    .intl {{ display:inline-block; margin-left:6px; padding:2px 6px; border-radius:5px; font-size:10px;
+            font-weight:700; background:rgba(19,239,149,0.18); color:{accent}; border:1px solid {accent};
+            letter-spacing:0.5px; vertical-align:middle; }}
   </style>
 </head>
 <body>
@@ -443,7 +478,30 @@ def _staff_html(refresh: int) -> str:
         // Fill phone
         fetch('/api/orders/phone/' + o.order_number, {{ cache: 'no-store' }})
           .then(r => r.json())
-          .then(d => {{ tr.querySelector('[data-phone]').textContent = d.phone || '—'; }})
+          .then(d => {{
+            const cell = tr.querySelector('[data-phone]');
+            const esc = (t) => String(t == null ? '' : t).replace(/[&<>"]/g,
+              c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+            // international numbers get a marker so staff know delivery may lag
+            const intl = (d.phone && !/^\+1\d{{10}}$/.test(d.phone))
+              ? '<span class="intl">INTL</span>' : '';
+            const num = d.phone
+              ? '<span class="nowrap">' + esc(d.phone) + '</span>' + intl : '';
+            const why = d.sms_reason ? '<span class="why">' + esc(d.sms_reason) + '</span>' : '';
+
+            // message follows what the confirmation SMS actually did
+            if (d.sms_status === 'sent') {{
+              cell.innerHTML = num;
+            }} else if (d.sms_status === 'failed') {{
+              cell.innerHTML = num +
+                '<div class="nosms failed">SMS failed — pickup by order number' + why + '</div>';
+            }} else if (d.sms_status === 'pending') {{
+              cell.innerHTML = num + '<div class="nosms pending">sending text…</div>';
+            }} else {{
+              cell.innerHTML = num +
+                '<div class="nosms">no SMS — pickup by order number' + why + '</div>';
+            }}
+          }})
           .catch(() => {{ tr.querySelector('[data-phone]').textContent = '—'; }});
 
         // Fill details
@@ -482,6 +540,7 @@ def _staff_html(refresh: int) -> str:
           const msg = JSON.parse(ev.data);
           if (msg.type === 'order_created' ||
               msg.type === 'order_status_changed' ||
+              msg.type === 'order_sms_status' ||
               msg.type === 'CallEnded') {{
             load();
           }}
